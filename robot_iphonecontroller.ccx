@@ -1,0 +1,384 @@
+// =====================================================================
+// ESP32 RC CAR - merged sketch
+//
+// Hardware: ACEBOTT ESP32 Max V1.0 + HiLetgo L293D V1 motor shield
+//           (Adafruit Motor Shield v1 clone) + 4x TT motors.
+//
+// Pin mapping comes from the RASTICxHackH Spring 2025 code, which is
+// tested on this exact board/shield combo. BLE protocol (Nordic UART
+// UUIDs, single-char F/B/L/R/S commands, "ESP32_RC_CAR" name) is
+// unchanged from the phone-app version, so the existing app works as-is.
+//
+// Changes vs. the app version:
+//   - ACEBOTT GPIOs instead of D1 R32 GPIOs (also avoids GPIO12, a boot
+//     strapping pin that can stop the ESP32 from booting).
+//   - Short acceleration ramp and a stop before every direction reversal,
+//     which keeps L293D current spikes from browning out the ESP32
+//     while BLE is active. Stops are instant.
+//   - Fixed a race on the safety timeout that could cause one-tick
+//     stutters while driving.
+//   - Compiles on ESP32 Arduino core 2.x and 3.x.
+//   - Serial-only motor test ('T') to check wheel position/direction.
+//
+// Commands (BLE or Serial Monitor @115200):
+//   F forward, B backward, L spin left, R spin right, S stop
+//   T (Serial only) test each motor individually
+// =====================================================================
+
+#include <Arduino.h>
+#include <BLEDevice.h>
+#include <BLEServer.h>
+#include <BLEUtils.h>
+
+// ---------------------------------------------------------------------
+// PINS: ACEBOTT ESP32 Max V1.0 -> L293D V1 shield
+// ---------------------------------------------------------------------
+const int SR_DATA_PIN   = 23;  // shield D8  (DIR_SER)
+const int SR_CLOCK_PIN  = 25;  // shield D4  (DIR_CLK)
+const int SR_LATCH_PIN  = 16;  // shield D12 (DIR_LATCH)
+const int SR_ENABLE_PIN = 4;   // shield D7  (DIR_EN, active low), jumpered to GPIO4
+
+// Enable (PWM) pin for shield terminals M1, M2, M3, M4
+const int motorPWM[4] = {17, 26, 13, 14};  // shield D11, D3, D5, D6
+
+// 74HC595 bits for each shield terminal (standard Adafruit v1 layout)
+const int motorA[4] = {2, 1, 5, 0};
+const int motorB[4] = {3, 4, 7, 6};
+
+// ---------------------------------------------------------------------
+// CAR LAYOUT (from the app version; this is the car's physical wiring)
+//   M1 = Front Right, M2 = Front Left, M3 = Rear Left, M4 = Rear Right
+// Flip a sign here if a wheel spins backwards. Use 'T' to check.
+// ---------------------------------------------------------------------
+const bool motorIsLeft[4] = {false, true, true, false};
+const int  polarity[4]    = {1, -1, -1, 1};
+const char* motorName[4]  = {"M1 Front Right", "M2 Front Left",
+                             "M3 Rear Left",   "M4 Rear Right"};
+
+// ---------------------------------------------------------------------
+// TUNING
+// ---------------------------------------------------------------------
+const int DRIVE_SPEED = 190;   // 0-255
+const int TURN_SPEED  = 180;   // 0-255
+
+const int PWM_FREQ = 5000;     // Hz, same as the hackathon code
+const int PWM_RES  = 8;        // bits (0-255)
+
+// Ramp: speed rises RAMP_STEP every RAMP_INTERVAL_MS. 0 -> 190 takes
+// about 70 ms. Set RAMP_STEP to 255 to disable ramping.
+const int RAMP_STEP = 30;
+const unsigned long RAMP_INTERVAL_MS = 10;
+
+// Safety timeout: stop if no command arrives for this long.
+// 0 = disabled, so a command holds until the next one (needed for
+// nRF Connect, which sends one write per tap). The car always stops
+// on BLE disconnect. Set to e.g. 700 if you move to an app that
+// resends commands while a button is held.
+const unsigned long TIMEOUT_MS = 0;
+
+// ---------------------------------------------------------------------
+// BLE (Nordic UART service UUIDs, same as the app version)
+// ---------------------------------------------------------------------
+#define DEVICE_NAME  "ESP32_RC_CAR"
+#define SERVICE_UUID "6E400001-B5A3-F393-E0A9-E50E24DCCA9E"
+#define RX_UUID      "6E400002-B5A3-F393-E0A9-E50E24DCCA9E"
+
+volatile bool connected = false;
+volatile char requestedCommand = 'S';
+volatile unsigned long lastCommandTime = 0;
+
+bool wasConnected = false;
+char lastPrintedCommand = 0;
+
+// Current (ramped) speeds per side, -255..255
+int curLeft = 0;
+int curRight = 0;
+uint8_t lastDirectionBits = 0xFF;  // force first write
+unsigned long lastRampTime = 0;
+
+// ---------------------------------------------------------------------
+// PWM helpers: ESP32 Arduino core 2.x and 3.x have different LEDC APIs
+// ---------------------------------------------------------------------
+#if defined(ESP_ARDUINO_VERSION_MAJOR) && ESP_ARDUINO_VERSION_MAJOR >= 3
+  #define LEDC_API_V3 1
+#else
+  #define LEDC_API_V3 0
+  const int motorChannel[4] = {4, 5, 6, 7};  // same channels as hackathon code
+#endif
+
+void pwmInit(int i) {
+#if LEDC_API_V3
+  ledcAttach(motorPWM[i], PWM_FREQ, PWM_RES);
+#else
+  ledcSetup(motorChannel[i], PWM_FREQ, PWM_RES);
+  ledcAttachPin(motorPWM[i], motorChannel[i]);
+#endif
+}
+
+void pwmWrite(int i, int duty) {
+#if LEDC_API_V3
+  ledcWrite(motorPWM[i], duty);
+#else
+  ledcWrite(motorChannel[i], duty);
+#endif
+}
+
+// ---------------------------------------------------------------------
+// MOTOR OUTPUT
+// speeds[] are per shield terminal (M1..M4), after polarity, -255..255
+// ---------------------------------------------------------------------
+void writeShiftRegister(uint8_t bits) {
+  digitalWrite(SR_LATCH_PIN, LOW);
+  shiftOut(SR_DATA_PIN, SR_CLOCK_PIN, MSBFIRST, bits);
+  digitalWrite(SR_LATCH_PIN, HIGH);
+}
+
+void setMotorsRaw(int speeds[4]) {
+  uint8_t bits = 0;
+  for (int i = 0; i < 4; i++) {
+    speeds[i] = constrain(speeds[i], -255, 255);
+    if (speeds[i] > 0)      bits |= (1 << motorA[i]);
+    else if (speeds[i] < 0) bits |= (1 << motorB[i]);
+  }
+
+  // Only touch the shift register when a direction actually changes,
+  // and cut PWM first so no motor is driven during the switch.
+  if (bits != lastDirectionBits) {
+    for (int i = 0; i < 4; i++) pwmWrite(i, 0);
+    writeShiftRegister(bits);
+    lastDirectionBits = bits;
+  }
+
+  for (int i = 0; i < 4; i++) pwmWrite(i, abs(speeds[i]));
+}
+
+void applySides(int left, int right) {
+  int speeds[4];
+  for (int i = 0; i < 4; i++) {
+    speeds[i] = (motorIsLeft[i] ? left : right) * polarity[i];
+  }
+  setMotorsRaw(speeds);
+}
+
+void allStop() {
+  curLeft = 0;
+  curRight = 0;
+  applySides(0, 0);
+}
+
+// Move current speed toward target:
+//   - reversing: drop to 0 first (ramps up the new way next tick)
+//   - slowing/stopping: immediate
+//   - speeding up: RAMP_STEP per tick
+int rampToward(int current, int target) {
+  if (current != 0 && target != 0 && ((current > 0) != (target > 0))) {
+    return 0;
+  }
+  if (abs(target) <= abs(current)) {
+    return target;
+  }
+  if (target > current) return min(current + RAMP_STEP, target);
+  return max(current - RAMP_STEP, target);
+}
+
+void targetsForCommand(char cmd, int &left, int &right) {
+  switch (cmd) {
+    case 'F': left =  DRIVE_SPEED; right =  DRIVE_SPEED; break;
+    case 'B': left = -DRIVE_SPEED; right = -DRIVE_SPEED; break;
+    case 'L': left = -TURN_SPEED;  right =  TURN_SPEED;  break;
+    case 'R': left =  TURN_SPEED;  right = -TURN_SPEED;  break;
+    case 'S':
+    default:  left = 0;            right = 0;            break;
+  }
+}
+
+// ---------------------------------------------------------------------
+// MOTOR TEST (Serial 'T'): runs each terminal "forward" for 1 s.
+// Every wheel should roll the car forward, in the order printed.
+// ---------------------------------------------------------------------
+void motorTest() {
+  Serial.println("Motor test: each wheel should spin FORWARD, one at a time.");
+  allStop();
+  for (int m = 0; m < 4; m++) {
+    Serial.printf("  %s (shield M%d, PWM GPIO%d)\n", motorName[m], m + 1, motorPWM[m]);
+    int speeds[4] = {0, 0, 0, 0};
+    speeds[m] = DRIVE_SPEED * polarity[m];
+    setMotorsRaw(speeds);
+    delay(1000);
+    allStop();
+    delay(400);
+  }
+  Serial.println("Motor test done.");
+  requestedCommand = 'S';
+  lastCommandTime = millis();
+}
+
+// ---------------------------------------------------------------------
+// COMMAND INPUT
+// ---------------------------------------------------------------------
+void receiveCommand(char c) {
+  c = toupper(c);
+  if (c == 'F' || c == 'B' || c == 'L' || c == 'R' || c == 'S') {
+    requestedCommand = c;
+    lastCommandTime = millis();
+  }
+}
+
+class ServerCallbacks : public BLEServerCallbacks {
+  void onConnect(BLEServer* server) override {
+    connected = true;
+    requestedCommand = 'S';
+    Serial.println("Phone connected!");
+  }
+  void onDisconnect(BLEServer* server) override {
+    connected = false;
+    requestedCommand = 'S';
+    Serial.println("Phone disconnected!");
+  }
+};
+
+// Adafruit Bluefruit Connect "Control Pad" packet: '!' 'B' <button> <'1'|'0'> <crc>
+// Buttons: '5' up, '6' down, '7' left, '8' right. '1' pressed, '0' released.
+char activePadCommand = 0;
+
+bool handleBluefruitButton(const uint8_t* d, size_t len) {
+  if (len < 5 || d[0] != '!' || d[1] != 'B') return false;
+
+  uint8_t sum = 0;
+  for (int i = 0; i < 4; i++) sum += d[i];
+  if ((uint8_t)~sum != d[4]) return true;  // bad checksum: ignore packet
+
+  char cmd = 0;
+  switch (d[2]) {
+    case '5': cmd = 'F'; break;
+    case '6': cmd = 'B'; break;
+    case '7': cmd = 'L'; break;
+    case '8': cmd = 'R'; break;
+    default:  cmd = 'S'; break;  // buttons 1-4 = stop
+  }
+
+  if (d[3] == '1') {
+    activePadCommand = cmd;
+    receiveCommand(cmd);
+  } else if (cmd == activePadCommand) {
+    // Releasing the held button stops the car. Releasing a different
+    // button (rolling thumb across the pad) doesn't.
+    activePadCommand = 0;
+    receiveCommand('S');
+  }
+  return true;
+}
+
+class ReceiveCallbacks : public BLECharacteristicCallbacks {
+  void onWrite(BLECharacteristic* characteristic) override {
+    uint8_t* d = characteristic->getData();
+    size_t len = characteristic->getLength();
+    if (d == nullptr || len == 0) return;
+
+    if (handleBluefruitButton(d, len)) return;
+
+    // Plain text: any F/B/L/R/S characters (newlines etc. are ignored)
+    for (size_t i = 0; i < len; i++) {
+      receiveCommand((char)d[i]);
+    }
+  }
+};
+
+// ---------------------------------------------------------------------
+// SETUP
+// ---------------------------------------------------------------------
+void setup() {
+  Serial.begin(115200);
+
+  // Keep shift register outputs disabled until they hold a known value
+  digitalWrite(SR_ENABLE_PIN, HIGH);
+  pinMode(SR_ENABLE_PIN, OUTPUT);
+
+  pinMode(SR_DATA_PIN, OUTPUT);
+  pinMode(SR_CLOCK_PIN, OUTPUT);
+  pinMode(SR_LATCH_PIN, OUTPUT);
+
+  for (int i = 0; i < 4; i++) {
+    pwmInit(i);
+    pwmWrite(i, 0);
+  }
+
+  allStop();                        // all direction bits off
+  digitalWrite(SR_ENABLE_PIN, LOW); // now enable outputs
+
+  // BLE
+  BLEDevice::init(DEVICE_NAME);
+  BLEServer* server = BLEDevice::createServer();
+  server->setCallbacks(new ServerCallbacks());
+
+  BLEService* service = server->createService(SERVICE_UUID);
+  BLECharacteristic* rx = service->createCharacteristic(
+    RX_UUID,
+    BLECharacteristic::PROPERTY_WRITE | BLECharacteristic::PROPERTY_WRITE_NR
+  );
+  rx->setCallbacks(new ReceiveCallbacks());
+  service->start();
+
+  BLEAdvertising* advertising = BLEDevice::getAdvertising();
+  advertising->addServiceUUID(SERVICE_UUID);
+  advertising->setScanResponse(true);   // device name goes in scan response
+  advertising->setMinPreferred(0x06);   // helps iPhones connect
+  advertising->setMinPreferred(0x12);
+  BLEDevice::startAdvertising();
+
+  Serial.println("ESP32 RC Car Ready!");
+  Serial.println("Bluetooth: " DEVICE_NAME);
+  Serial.println("Commands: F B L R S   (Serial only: T = motor test)");
+}
+
+// ---------------------------------------------------------------------
+// LOOP
+// ---------------------------------------------------------------------
+void loop() {
+  // Serial commands
+  while (Serial.available()) {
+    char c = toupper(Serial.read());
+    if (c == 'T') motorTest();
+    else receiveCommand(c);
+  }
+
+  // Restart advertising after a disconnect
+  if (!connected && wasConnected) {
+    requestedCommand = 'S';
+    delay(200);
+    BLEDevice::startAdvertising();
+    wasConnected = false;
+    Serial.println("Advertising again");
+  }
+  if (connected) wasConnected = true;
+
+  // Read the timestamp BEFORE millis(). The BLE callback runs on another
+  // task, and reading millis() first could give lastCommandTime > now,
+  // which wraps the unsigned subtraction and causes a false timeout stop.
+  unsigned long cmdTime = lastCommandTime;
+  char cmd = requestedCommand;
+  unsigned long now = millis();
+  if (TIMEOUT_MS > 0 && now - cmdTime > TIMEOUT_MS) cmd = 'S';
+
+  if (cmd != lastPrintedCommand) {
+    Serial.print("Movement: ");
+    Serial.println(cmd);
+    lastPrintedCommand = cmd;
+  }
+
+  // Ramp and apply
+  if (now - lastRampTime >= RAMP_INTERVAL_MS) {
+    lastRampTime = now;
+    int tLeft, tRight;
+    targetsForCommand(cmd, tLeft, tRight);
+    int newLeft  = rampToward(curLeft, tLeft);
+    int newRight = rampToward(curRight, tRight);
+    if (newLeft != curLeft || newRight != curRight) {
+      curLeft = newLeft;
+      curRight = newRight;
+      applySides(curLeft, curRight);
+    }
+  }
+
+  delay(2);
+}
