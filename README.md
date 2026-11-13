@@ -1,5 +1,3 @@
-# ek210_esp32_rc_code
-EK210 fall 2026 code for ESP32 rc car
+EK210 GROUP 9 CAD and ESP32 CODE REPOSITORY
 
-
-## code
+SK, LM, GT, DD
